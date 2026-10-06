@@ -123,6 +123,10 @@ const primitiveOperators = new Set([
   ">>>",
 ])
 
+/** ToPropertyKey on a primitive (or an opaque value, which keeps its built-in string form). */
+const propertyKey = (value: Value): PropertyKey =>
+  typeof value === "string" || typeof value === "number" || typeof value === "symbol" ? value : coerceToString(value)
+
 // What a loop does with its body's result: exit with a StatementResult, or undefined to keep iterating.
 // Unlabelled break ends this loop; a label the loop does not carry propagates outward.
 const loopExit = (result: StatementResult, labels: ReadonlySet<string> | undefined): StatementResult | undefined => {
@@ -1136,18 +1140,15 @@ class Frame<R> {
       }
 
       if (pattern.type === "ObjectPattern") {
-        if (!(value instanceof Obj)) {
-          throw typeError(
-            `Object destructuring requires a data object or array value, received ${describeValue(value)}.`,
-            pattern,
-          )
+        if (value === null || value === undefined) {
+          throw typeError(`Cannot destructure ${describeValue(value)} as it is ${value}.`, pattern)
         }
 
         const consumed = new Set<PropertyKey>()
         for (const property of pattern.properties) {
           if (property.type === "RestElement") {
             const rest = new Obj(self.ctx.builtins.Object)
-            assign(rest, value, consumed)
+            assign(rest, enumerableSource(self.ctx, "Object destructuring", value, pattern), consumed)
             yield* self.declarePattern(property.argument, rest, mutable, property, initialize)
             continue
           }
@@ -1156,7 +1157,7 @@ class Frame<R> {
           consumed.add(typeof key === "symbol" ? key : String(key))
           yield* self.declarePattern(
             property.value,
-            self.readProperty(value, key, property),
+            self.destructuredProperty(value, key, property),
             mutable,
             property,
             initialize,
@@ -1195,24 +1196,21 @@ class Frame<R> {
       }
 
       if (pattern.type === "ObjectPattern") {
-        if (!(value instanceof Obj)) {
-          throw invalidData(
-            `Object destructuring requires a data object or array value, received ${describeValue(value)}.`,
-            pattern,
-          )
+        if (value === null || value === undefined) {
+          throw typeError(`Cannot destructure ${describeValue(value)} as it is ${value}.`, pattern)
         }
 
         const consumed = new Set<PropertyKey>()
         for (const property of pattern.properties) {
           if (property.type === "RestElement") {
             const rest = new Obj(self.ctx.builtins.Object)
-            assign(rest, value, consumed)
+            assign(rest, enumerableSource(self.ctx, "Object destructuring", value, pattern), consumed)
             yield* self.assignPattern(property.argument, rest, property)
             continue
           }
           const key = yield* self.destructuringPropertyKey(property)
           consumed.add(typeof key === "symbol" ? key : String(key))
-          yield* self.assignPattern(property.value, self.readProperty(value, key, property), property)
+          yield* self.assignPattern(property.value, self.destructuredProperty(value, key, property), property)
         }
         return
       }
@@ -1283,7 +1281,7 @@ class Frame<R> {
     }
     const keyNode = property.key
     if (property.computed) {
-      return Effect.map(this.evaluateExpression(keyNode), (value) => this.toPropertyKey(value))
+      return Effect.flatMap(this.evaluateExpression(keyNode), (value) => this.toPropertyKey(value, keyNode))
     }
     if (keyNode.type === "Identifier") return Effect.succeed(keyNode.name)
     if (keyNode.type === "Literal") return Effect.succeed(String(keyNode.value))
@@ -1406,6 +1404,10 @@ class Frame<R> {
     // IsLooselyEqual converts only an object facing a non-nullish primitive; two objects (including tool
     // references, which are not Obj) compare by identity.
     const equality = operator === "==" || operator === "!="
+    // `in` checks the right operand before ToPropertyKey on the left, so a bad right side wins over a bad key.
+    if (operator === "in" && lhs instanceof Obj && !isOpaque(lhs) && rhs instanceof Obj) {
+      return Effect.map(this.toPropertyKey(lhs, node), (key) => has(rhs, key))
+    }
     const other = lhs instanceof Obj ? rhs : lhs
     const converts =
       primitiveOperators.has(operator) ||
@@ -1425,9 +1427,7 @@ class Frame<R> {
     if (operator === "!==") return lhs !== rhs
     if (operator === "==") return this.looselyEqual(lhs, rhs, node)
     if (operator === "!=") return !this.looselyEqual(lhs, rhs, node)
-    if (operator === "in" && rhs instanceof Obj && !isOpaque(lhs)) {
-      return has(rhs, lhs !== null && typeof lhs === "object" ? coerceToString(lhs) : (lhs as PropertyKey))
-    }
+    if (operator === "in" && rhs instanceof Obj && !isOpaque(lhs)) return has(rhs, propertyKey(lhs))
     if (isOpaque(lhs) || isOpaque(rhs)) {
       throw invalidData("Binary operators require data values.", node)
     }
@@ -2052,11 +2052,11 @@ class Frame<R> {
         let key: PropertyKey
 
         if (property.computed) {
-          key = self.toPropertyKey(yield* self.evaluateExpression(keyNode))
+          key = yield* self.toPropertyKey(yield* self.evaluateExpression(keyNode), keyNode)
         } else if (keyNode.type === "Identifier") {
           key = keyNode.name
         } else if (keyNode.type === "Literal") {
-          key = self.toPropertyKey(literal(keyNode))
+          key = propertyKey(literal(keyNode))
         } else {
           throw typeError("Unsupported object property key shape.", keyNode)
         }
@@ -2184,35 +2184,56 @@ class Frame<R> {
       if (objectValue === OptionalShortCircuit) return OptionalShortCircuit
       if ((objectValue === null || objectValue === undefined) && node.optional) return OptionalShortCircuit
 
-      const key = node.computed
-        ? self.toPropertyKey(yield* self.evaluateExpression(propertyNode))
-        : propertyNode.type === "Identifier"
+      const keyValue =
+        !node.computed && propertyNode.type === "Identifier"
           ? propertyNode.name
-          : self.toPropertyKey(yield* self.evaluateExpression(propertyNode))
-
-      if (objectValue instanceof ToolReference) {
-        if (typeof key !== "string") {
-          throw typeError("Tool paths must use string property names.", propertyNode)
-        }
-        return new ToolReference([...objectValue.path, key])
-      }
-
-      if (objectValue instanceof Obj) return { target: objectValue, key, receiver: objectValue }
-
-      // Strings own length and indexes; every other primitive property reads through the wrapper prototype.
-      if (typeof objectValue === "string") {
-        if (key === "length") return { value: objectValue.length }
-        const index = typeof key === "symbol" ? undefined : parseArrayIndex(key)
-        if (index !== undefined) return { value: objectValue[index] }
-      }
-      const proto = primitivePrototype(self.ctx.builtins, objectValue)
-      if (proto !== undefined) return { target: proto, key, receiver: objectValue }
-
+          : yield* self.evaluateExpression(propertyNode)
+      // GetValue applies ToObject to the base before ToPropertyKey, so a nullish base throws before the key's own
+      // toString runs.
       if (objectValue === null || objectValue === undefined) {
-        throw typeError(`Cannot read properties of ${objectValue} (reading '${String(key)}').`, objectNode)
+        throw typeError(`Cannot read properties of ${objectValue} (reading '${coerceToString(keyValue)}').`, objectNode)
       }
-      throw typeError("Cannot access a property on a non-object value.", objectNode)
+      const key = yield* self.toPropertyKey(keyValue, propertyNode)
+      return self.resolveProperty(objectValue, key, objectNode, propertyNode)
     })
+  }
+
+  private resolveProperty(
+    objectValue: Value,
+    key: PropertyKey,
+    objectNode: AstNode,
+    propertyNode: AstNode,
+  ): MemberReference | ToolReference | { value: Value } {
+    if (objectValue instanceof ToolReference) {
+      if (typeof key !== "string") {
+        throw typeError("Tool paths must use string property names.", propertyNode)
+      }
+      return new ToolReference([...objectValue.path, key])
+    }
+
+    if (objectValue instanceof Obj) return { target: objectValue, key, receiver: objectValue }
+
+    // Strings own length and indexes; every other primitive property reads through the wrapper prototype.
+    if (typeof objectValue === "string") {
+      if (key === "length") return { value: objectValue.length }
+      const index = typeof key === "symbol" ? undefined : parseArrayIndex(key)
+      if (index !== undefined) return { value: objectValue[index] }
+    }
+    const proto = primitivePrototype(this.ctx.builtins, objectValue)
+    if (proto !== undefined) return { target: proto, key, receiver: objectValue }
+
+    if (objectValue === null || objectValue === undefined) {
+      throw typeError(`Cannot read properties of ${objectValue} (reading '${String(key)}').`, objectNode)
+    }
+    throw typeError("Cannot access a property on a non-object value.", objectNode)
+  }
+
+  // One destructured property, read the way a member expression would read it (primitives use their prototype).
+  private destructuredProperty(source: Value, key: PropertyKey, node: AstNode): Value {
+    const reference = this.resolveProperty(source, key, node, node)
+    if (reference instanceof ToolReference) return reference
+    if ("value" in reference) return reference.value
+    return this.readProperty(reference.target, reference.key, node, reference.receiver)
   }
 
   private readReference(reference: MemberReference, node: MemberExpression): Value {
@@ -2304,9 +2325,10 @@ class Frame<R> {
     throw typeError(`Cannot assign to read only property '${String(key)}'.`, node)
   }
 
-  // ToPropertyKey: anything else becomes its string form, so `counts[row.category]` works when the field is null.
-  private toPropertyKey(value: Value): PropertyKey {
-    if (typeof value === "string" || typeof value === "number" || typeof value === "symbol") return value
-    return coerceToString(value)
+  // ToPropertyKey: a data object converts through its own `toString`/`valueOf` first; anything else becomes its
+  // string form synchronously, so `counts[row.category]` works when the field is null.
+  private toPropertyKey(value: Value, node: AstNode): Effect.Effect<PropertyKey, unknown, R> {
+    if (!(value instanceof Obj)) return Effect.succeed(propertyKey(value))
+    return Effect.map(this.toPrimitive(value, "string", node), propertyKey)
   }
 }
